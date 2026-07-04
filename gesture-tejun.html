@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>手順表</title>
+<style>
+  :root{
+    --bg:#1c2430;
+    --panel:#26313f;
+    --ink:#f3f6fa;
+    --sub:#9fb0c3;
+    --next:#3ea16f;   /* 次へ：緑 */
+    --prev:#c9772e;   /* 戻る：橙 */
+    --line:#3a4757;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+  html,body{height:100%;}
+  body{
+    background:var(--bg);color:var(--ink);
+    font-family:-apple-system,"Hiragino Sans","Yu Gothic",sans-serif;
+    overflow:hidden;user-select:none;
+  }
+  #app{position:fixed;inset:0;display:flex;flex-direction:column;}
+
+  /* カメラ映像（薄く背景に） */
+  #cam{
+    position:absolute;inset:0;width:100%;height:100%;
+    object-fit:cover;transform:scaleX(-1);
+    opacity:0.18;filter:grayscale(1);
+  }
+  #work{display:none;}
+
+  /* 手順表示 */
+  .stage{
+    position:relative;z-index:2;flex:1;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    padding:24px 96px;text-align:center;
+  }
+  .stepno{font-size:20px;color:var(--sub);letter-spacing:.1em;margin-bottom:12px;}
+  .emoji{font-size:88px;line-height:1;margin-bottom:20px;}
+  .steptext{font-size:40px;font-weight:700;line-height:1.4;}
+
+  /* 進捗ドット */
+  .dots{
+    position:relative;z-index:2;display:flex;gap:10px;justify-content:center;
+    padding-bottom:18px;flex-wrap:wrap;
+  }
+  .dot{width:14px;height:14px;border-radius:50%;background:var(--line);}
+  .dot.on{background:var(--ink);}
+
+  /* 左右ゾーン */
+  .zone{
+    position:absolute;top:0;bottom:0;width:88px;z-index:3;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:10px;color:#fff;font-weight:700;
+    background:rgba(255,255,255,.02);
+  }
+  .zone.left{left:0;border-right:1px solid var(--line);}
+  .zone.right{right:0;border-left:1px solid var(--line);}
+  .zone .ic{font-size:34px;}
+  .zone .lbl{font-size:15px;}
+  /* 充填バー */
+  .fill{position:absolute;left:0;bottom:0;width:100%;height:0%;opacity:.55;transition:height .06s linear;}
+  .zone.left  .fill{background:var(--prev);}
+  .zone.right .fill{background:var(--next);}
+  .zone.hot{background:rgba(255,255,255,.10);}
+
+  /* 上部バー */
+  #bar{
+    position:relative;z-index:4;display:flex;gap:10px;align-items:center;
+    padding:12px 96px;font-size:14px;color:var(--sub);
+  }
+  #bar .status{flex:1;}
+  #startBtn{
+    background:var(--next);color:#fff;border:none;border-radius:12px;
+    padding:12px 20px;font-size:17px;font-weight:700;
+  }
+  .pill{padding:4px 10px;border:1px solid var(--line);border-radius:999px;}
+</style>
+</head>
+<body>
+<div id="app">
+  <video id="cam" playsinline muted autoplay></video>
+  <canvas id="work" width="120" height="90"></canvas>
+
+  <div id="bar">
+    <span class="status" id="status">「はじめる」を押してカメラを許可してください</span>
+    <button id="startBtn">はじめる</button>
+  </div>
+
+  <div class="stage">
+    <div class="stepno" id="stepno"></div>
+    <div class="emoji" id="emoji"></div>
+    <div class="steptext" id="steptext"></div>
+  </div>
+
+  <div class="dots" id="dots"></div>
+
+  <div class="zone left" id="zoneL">
+    <div class="fill" id="fillL"></div>
+    <div class="ic">◀</div><div class="lbl">もどる</div>
+  </div>
+  <div class="zone right" id="zoneR">
+    <div class="fill" id="fillR"></div>
+    <div class="ic">▶</div><div class="lbl">つぎへ</div>
+  </div>
+</div>
+
+<script>
+/* ▼ 手順の中身：ここを書き換えれば内容を差し替えられます ▼ */
+const STEPS = [
+  {emoji:"🚰", text:"じゃぐちを ひねって\n水を だす"},
+  {emoji:"🧼", text:"せっけんを つける"},
+  {emoji:"👐", text:"てのひらを\nこすり合わせる"},
+  {emoji:"🖐️", text:"ゆびの あいだも\nあらう"},
+  {emoji:"💧", text:"水で よく ながす"},
+  {emoji:"🧻", text:"タオルで ふく"},
+];
+/* ▲ ここまで ▲ */
+
+const cam=document.getElementById('cam');
+const cv=document.getElementById('work'), ctx=cv.getContext('2d',{willReadFrequently:true});
+const W=cv.width, H=cv.height;
+const emojiEl=document.getElementById('emoji');
+const textEl=document.getElementById('steptext');
+const stepnoEl=document.getElementById('stepno');
+const dotsEl=document.getElementById('dots');
+const statusEl=document.getElementById('status');
+const startBtn=document.getElementById('startBtn');
+const zoneL=document.getElementById('zoneL'), zoneR=document.getElementById('zoneR');
+const fillL=document.getElementById('fillL'), fillR=document.getElementById('fillR');
+
+let idx=0, prev=null, running=false;
+let holdL=0, holdR=0, cooldown=0;
+
+/* 調整パラメータ（現場に合わせて変える） */
+const MOTION_TH=18;   // 動きと判定する明るさ変化のしきい値
+const AREA_TH=0.06;   // ゾーン内でどれだけ動いたら反応するか（0〜1）
+const HOLD_NEED=14;   // 確定に必要なフレーム数（≒かざし続ける時間。大=長い）
+const COOLDOWN=40;    // 切替後の無反応フレーム数（連続誤反応ふせぎ）
+
+function render(){
+  const s=STEPS[idx];
+  emojiEl.textContent=s.emoji;
+  textEl.textContent=s.text;
+  stepnoEl.textContent=`${idx+1} / ${STEPS.length}`;
+  dotsEl.innerHTML=STEPS.map((_,i)=>`<span class="dot ${i===idx?'on':''}"></span>`).join('');
+}
+function go(dir){
+  const n=idx+dir;
+  if(n<0||n>=STEPS.length) return;
+  idx=n; render(); cooldown=COOLDOWN;
+  holdL=holdR=0; fillL.style.height='0%'; fillR.style.height='0%';
+}
+
+async function start(){
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:'user'}, audio:false
+    });
+    cam.srcObject=stream;
+    running=true; startBtn.style.display='none';
+    statusEl.textContent='手を 左右に かざして ページを めくれます';
+    loop();
+  }catch(e){
+    statusEl.textContent='カメラを 使えません：'+e.name+'（設定でカメラを許可してください）';
+  }
+}
+
+function loop(){
+  if(!running) return;
+  ctx.drawImage(cam,0,0,W,H);
+  const cur=ctx.getImageData(0,0,W,H).data;
+  if(prev){
+    // 左1/3・右1/3の動き量を測る（映像は鏡像なので画面の左右と一致）
+    let ml=0,mr=0,cl=0,cr=0;
+    for(let y=0;y<H;y++){
+      for(let x=0;x<W;x++){
+        const i=(y*W+x)*4;
+        const d=Math.abs(cur[i]-prev[i])+Math.abs(cur[i+1]-prev[i+1])+Math.abs(cur[i+2]-prev[i+2]);
+        if(x < W/3){ cl++; if(d>MOTION_TH*3) ml++; }
+        else if(x > W*2/3){ cr++; if(d>MOTION_TH*3) mr++; }
+      }
+    }
+    const rl=ml/cl, rr=mr/cr;
+
+    if(cooldown>0){ cooldown--; }
+    else{
+      // 左ゾーン＝もどる
+      if(rl>AREA_TH){ holdL++; zoneL.classList.add('hot'); } else { holdL=Math.max(0,holdL-2); if(holdL===0) zoneL.classList.remove('hot'); }
+      // 右ゾーン＝つぎへ
+      if(rr>AREA_TH){ holdR++; zoneR.classList.add('hot'); } else { holdR=Math.max(0,holdR-2); if(holdR===0) zoneR.classList.remove('hot'); }
+
+      fillL.style.height=Math.min(100,holdL/HOLD_NEED*100)+'%';
+      fillR.style.height=Math.min(100,holdR/HOLD_NEED*100)+'%';
+
+      if(holdL>=HOLD_NEED) go(-1);
+      if(holdR>=HOLD_NEED) go(1);
+    }
+  }
+  prev=cur;
+  requestAnimationFrame(loop);
+}
+
+startBtn.addEventListener('click',start);
+render();
+</script>
+</body>
+</html>
