@@ -7,7 +7,6 @@
 <style>
   :root{
     --bg:#1c2430;
-    --panel:#26313f;
     --ink:#f3f6fa;
     --sub:#9fb0c3;
     --next:#3ea16f;   /* 次へ：緑 */
@@ -23,15 +22,13 @@
   }
   #app{position:fixed;inset:0;display:flex;flex-direction:column;}
 
-  /* カメラ映像（薄く背景に） */
-  #cam{
+  #cam,#overlay{
     position:absolute;inset:0;width:100%;height:100%;
     object-fit:cover;transform:scaleX(-1);
-    opacity:0.18;filter:grayscale(1);
   }
-  #work{display:none;}
+  #cam{opacity:0.16;filter:grayscale(1);}
+  #overlay{z-index:1;pointer-events:none;}
 
-  /* 手順表示 */
   .stage{
     position:relative;z-index:2;flex:1;
     display:flex;flex-direction:column;align-items:center;justify-content:center;
@@ -39,9 +36,8 @@
   }
   .stepno{font-size:20px;color:var(--sub);letter-spacing:.1em;margin-bottom:12px;}
   .emoji{font-size:88px;line-height:1;margin-bottom:20px;}
-  .steptext{font-size:40px;font-weight:700;line-height:1.4;}
+  .steptext{font-size:40px;font-weight:700;line-height:1.4;white-space:pre-line;}
 
-  /* 進捗ドット */
   .dots{
     position:relative;z-index:2;display:flex;gap:10px;justify-content:center;
     padding-bottom:18px;flex-wrap:wrap;
@@ -49,9 +45,8 @@
   .dot{width:14px;height:14px;border-radius:50%;background:var(--line);}
   .dot.on{background:var(--ink);}
 
-  /* 左右ゾーン */
   .zone{
-    position:absolute;top:0;bottom:0;width:88px;z-index:3;
+    position:absolute;top:0;bottom:0;width:92px;z-index:3;
     display:flex;flex-direction:column;align-items:center;justify-content:center;
     gap:10px;color:#fff;font-weight:700;
     background:rgba(255,255,255,.02);
@@ -60,33 +55,31 @@
   .zone.right{right:0;border-left:1px solid var(--line);}
   .zone .ic{font-size:34px;}
   .zone .lbl{font-size:15px;}
-  /* 充填バー */
   .fill{position:absolute;left:0;bottom:0;width:100%;height:0%;opacity:.55;transition:height .06s linear;}
   .zone.left  .fill{background:var(--prev);}
   .zone.right .fill{background:var(--next);}
   .zone.hot{background:rgba(255,255,255,.10);}
 
-  /* 上部バー */
   #bar{
     position:relative;z-index:4;display:flex;gap:10px;align-items:center;
-    padding:12px 96px;font-size:14px;color:var(--sub);
+    padding:12px 96px;font-size:14px;color:var(--sub);min-height:56px;
   }
   #bar .status{flex:1;}
   #startBtn{
     background:var(--next);color:#fff;border:none;border-radius:12px;
     padding:12px 20px;font-size:17px;font-weight:700;
   }
-  .pill{padding:4px 10px;border:1px solid var(--line);border-radius:999px;}
+  #startBtn:disabled{opacity:.5;}
 </style>
 </head>
 <body>
 <div id="app">
   <video id="cam" playsinline muted autoplay></video>
-  <canvas id="work" width="120" height="90"></canvas>
+  <canvas id="overlay"></canvas>
 
   <div id="bar">
-    <span class="status" id="status">「はじめる」を押してカメラを許可してください</span>
-    <button id="startBtn">はじめる</button>
+    <span class="status" id="status">「はじめる」を押してください（初回は数秒かかります）</span>
+    <button id="startBtn" disabled>読み込み中…</button>
   </div>
 
   <div class="stage">
@@ -107,7 +100,10 @@
   </div>
 </div>
 
-<script>
+<script type="module">
+import { HandLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
 /* ▼ 手順の中身：ここを書き換えれば内容を差し替えられます ▼ */
 const STEPS = [
   {emoji:"🚰", text:"じゃぐちを ひねって\n水を だす"},
@@ -119,9 +115,15 @@ const STEPS = [
 ];
 /* ▲ ここまで ▲ */
 
+/* 調整パラメータ（現場に合わせて変える） */
+const LEFT_TH=0.40;   // 手が画面のどこまで左に来たら「もどる」判定か（0=左端,1=右端）
+const RIGHT_TH=0.60;  // 手がどこまで右に来たら「つぎへ」判定か
+const HOLD_NEED=16;   // 確定に必要なフレーム数（大きいほど長くかざす必要）
+const COOLDOWN=40;    // 切替後の無反応フレーム数（連続誤反応ふせぎ）
+
 const cam=document.getElementById('cam');
-const cv=document.getElementById('work'), ctx=cv.getContext('2d',{willReadFrequently:true});
-const W=cv.width, H=cv.height;
+const overlay=document.getElementById('overlay');
+const octx=overlay.getContext('2d');
 const emojiEl=document.getElementById('emoji');
 const textEl=document.getElementById('steptext');
 const stepnoEl=document.getElementById('stepno');
@@ -131,21 +133,15 @@ const startBtn=document.getElementById('startBtn');
 const zoneL=document.getElementById('zoneL'), zoneR=document.getElementById('zoneR');
 const fillL=document.getElementById('fillL'), fillR=document.getElementById('fillR');
 
-let idx=0, prev=null, running=false;
-let holdL=0, holdR=0, cooldown=0;
-
-/* 調整パラメータ（現場に合わせて変える） */
-const MOTION_TH=18;   // 動きと判定する明るさ変化のしきい値
-const AREA_TH=0.06;   // ゾーン内でどれだけ動いたら反応するか（0〜1）
-const HOLD_NEED=14;   // 確定に必要なフレーム数（≒かざし続ける時間。大=長い）
-const COOLDOWN=40;    // 切替後の無反応フレーム数（連続誤反応ふせぎ）
+let idx=0, running=false, landmarker=null;
+let holdL=0, holdR=0, cooldown=0, lastTime=-1;
 
 function render(){
   const s=STEPS[idx];
   emojiEl.textContent=s.emoji;
   textEl.textContent=s.text;
-  stepnoEl.textContent=`${idx+1} / ${STEPS.length}`;
-  dotsEl.innerHTML=STEPS.map((_,i)=>`<span class="dot ${i===idx?'on':''}"></span>`).join('');
+  stepnoEl.textContent=(idx+1)+" / "+STEPS.length;
+  dotsEl.innerHTML=STEPS.map((_,i)=>'<span class="dot '+(i===idx?'on':'')+'"></span>').join('');
 }
 function go(dir){
   const n=idx+dir;
@@ -154,12 +150,36 @@ function go(dir){
   holdL=holdR=0; fillL.style.height='0%'; fillR.style.height='0%';
 }
 
+/* 起動時にモデルを読み込む（初回はネット接続が必要） */
+async function initModel(){
+  try{
+    const vision=await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    landmarker=await HandLandmarker.createFromOptions(vision,{
+      baseOptions:{
+        modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate:"GPU"
+      },
+      runningMode:"VIDEO",
+      numHands:1
+    });
+    startBtn.disabled=false;
+    startBtn.textContent="はじめる";
+    statusEl.textContent="「はじめる」を押してカメラを許可してください";
+  }catch(e){
+    statusEl.textContent="読み込み失敗："+e.message+"（ネット接続を確認してください）";
+  }
+}
+
 async function start(){
   try{
     const stream=await navigator.mediaDevices.getUserMedia({
       video:{facingMode:'user'}, audio:false
     });
     cam.srcObject=stream;
+    await cam.play();
+    overlay.width=cam.videoWidth; overlay.height=cam.videoHeight;
     running=true; startBtn.style.display='none';
     statusEl.textContent='手を 左右に かざして ページを めくれます';
     loop();
@@ -170,41 +190,42 @@ async function start(){
 
 function loop(){
   if(!running) return;
-  ctx.drawImage(cam,0,0,W,H);
-  const cur=ctx.getImageData(0,0,W,H).data;
-  if(prev){
-    // 左1/3・右1/3の動き量を測る（映像は鏡像なので画面の左右と一致）
-    let ml=0,mr=0,cl=0,cr=0;
-    for(let y=0;y<H;y++){
-      for(let x=0;x<W;x++){
-        const i=(y*W+x)*4;
-        const d=Math.abs(cur[i]-prev[i])+Math.abs(cur[i+1]-prev[i+1])+Math.abs(cur[i+2]-prev[i+2]);
-        if(x < W/3){ cl++; if(d>MOTION_TH*3) ml++; }
-        else if(x > W*2/3){ cr++; if(d>MOTION_TH*3) mr++; }
-      }
-    }
-    const rl=ml/cl, rr=mr/cr;
-
-    if(cooldown>0){ cooldown--; }
-    else{
-      // 左ゾーン＝もどる
-      if(rl>AREA_TH){ holdL++; zoneL.classList.add('hot'); } else { holdL=Math.max(0,holdL-2); if(holdL===0) zoneL.classList.remove('hot'); }
-      // 右ゾーン＝つぎへ
-      if(rr>AREA_TH){ holdR++; zoneR.classList.add('hot'); } else { holdR=Math.max(0,holdR-2); if(holdR===0) zoneR.classList.remove('hot'); }
-
-      fillL.style.height=Math.min(100,holdL/HOLD_NEED*100)+'%';
-      fillR.style.height=Math.min(100,holdR/HOLD_NEED*100)+'%';
-
-      if(holdL>=HOLD_NEED) go(-1);
-      if(holdR>=HOLD_NEED) go(1);
+  const now=performance.now();
+  let handX=null;
+  if(landmarker && cam.readyState>=2 && now!==lastTime){
+    lastTime=now;
+    const res=landmarker.detectForVideo(cam,now);
+    octx.clearRect(0,0,overlay.width,overlay.height);
+    if(res.landmarks && res.landmarks.length>0){
+      const lm=res.landmarks[0];
+      const palm=lm[9];           // 中指付け根＝手のひら中心付近
+      handX=palm.x;               // 0=映像の左, 1=映像の右
+      octx.fillStyle="rgba(62,161,111,.9)";
+      octx.beginPath();
+      octx.arc(palm.x*overlay.width, palm.y*overlay.height, 26, 0, Math.PI*2);
+      octx.fill();
     }
   }
-  prev=cur;
+
+  const screenX = (handX===null) ? null : (1-handX);
+
+  if(cooldown>0){ cooldown--; }
+  else{
+    const inLeft  = screenX!==null && screenX < LEFT_TH;
+    const inRight = screenX!==null && screenX > RIGHT_TH;
+    if(inLeft){ holdL++; zoneL.classList.add('hot'); } else { holdL=0; zoneL.classList.remove('hot'); }
+    if(inRight){ holdR++; zoneR.classList.add('hot'); } else { holdR=0; zoneR.classList.remove('hot'); }
+    fillL.style.height=Math.min(100,holdL/HOLD_NEED*100)+'%';
+    fillR.style.height=Math.min(100,holdR/HOLD_NEED*100)+'%';
+    if(holdL>=HOLD_NEED) go(-1);
+    if(holdR>=HOLD_NEED) go(1);
+  }
   requestAnimationFrame(loop);
 }
 
 startBtn.addEventListener('click',start);
 render();
+initModel();
 </script>
 </body>
 </html>
